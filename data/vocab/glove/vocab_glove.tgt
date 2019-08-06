@@ -1,0 +1,6 @@
+unbekannt 1 0 0 0 0 0
+rechnungsnummer 0 1 0 0 0 0
+rechnungsdatum 0 0 1 0 0 0
+gesamtbetrag 0 0 0 1 0 0
+steuerbetrag 0 0 0 0 1 0
+uid-nummer 0 0 0 0 0 1
