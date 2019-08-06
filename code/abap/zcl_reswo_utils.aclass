@@ -1,0 +1,229 @@
+CLASS zcl_reswo_utils DEFINITION
+  PUBLIC
+  FINAL
+  CREATE PRIVATE.
+
+  PUBLIC SECTION.
+    CLASS-METHODS preprocess_word
+      IMPORTING
+        VALUE(iv_word)   TYPE csequence
+        !iv_numbers_to_0 TYPE abap_bool DEFAULT abap_true
+        !iv_letters_to_x TYPE abap_bool DEFAULT abap_false
+      RETURNING
+        VALUE(rv_word)   TYPE string.
+
+    CLASS-METHODS try_parse_decimal
+      IMPORTING
+        VALUE(iv_number)  TYPE csequence
+      EXPORTING
+        !ev_dec_separ     TYPE char1
+        !ev_grp_separ     TYPE char1
+      RETURNING
+        VALUE(rv_success) TYPE abap_bool.
+
+  PROTECTED SECTION.
+  PRIVATE SECTION.
+
+    CONSTANTS const_regex_www  TYPE string VALUE
+                `^(http(s?):\/\/)?(www\.)+[a-zA-Z0-9\.\-\_]+(\.[a-zA-Z]{2,3})+(\/[a-zA-Z0-9\_\-\s\.\/\?\%\#\&\=]*)?$`.
+    CONSTANTS const_regex_mail TYPE string VALUE
+            `^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$`.
+
+    CONSTANTS const_string_empty TYPE string VALUE ''.
+
+ENDCLASS.
+
+
+
+CLASS zcl_reswo_utils IMPLEMENTATION.
+
+
+  METHOD preprocess_word.
+    " replace all spaces
+    DATA(lv_word) = replace( val = iv_word sub = ` ` with = '' occ = 0 ).
+    " consider some special characters (e.g. % is relevant for tax)
+    IF NOT ( strlen( lv_word ) EQ 1 AND lv_word EQ '/' OR lv_word EQ '\'
+                OR lv_word EQ '€' OR lv_word EQ '$' OR lv_word EQ '%'
+                OR lv_word EQ '.' OR lv_word EQ ',' OR lv_word EQ ':' ).
+      " do replacements only if not special characters (see condition above)
+      lv_word = condense( val = lv_word del = `,‚./\;:#+-—` ).
+      " do some replacements (e.g. of obsolete characters)
+      REPLACE ALL OCCURRENCES: OF '|' IN lv_word WITH const_string_empty,
+                               OF '>' IN lv_word WITH const_string_empty,
+                               OF '<' IN lv_word WITH const_string_empty,
+                               OF '(' IN lv_word WITH const_string_empty,
+                               OF ')' IN lv_word WITH const_string_empty,
+                               OF '[' IN lv_word WITH const_string_empty,
+                               OF ']' IN lv_word WITH const_string_empty,
+                               OF '{' IN lv_word WITH const_string_empty,
+                               OF '}' IN lv_word WITH const_string_empty,
+                               OF '«' IN lv_word WITH const_string_empty,
+                               OF '»' IN lv_word WITH const_string_empty,
+                               OF '"' IN lv_word WITH const_string_empty,
+                               OF '”' IN lv_word WITH const_string_empty,
+                               OF '“' IN lv_word WITH const_string_empty,
+                               OF '„' IN lv_word WITH const_string_empty,
+                               OF '_' IN lv_word WITH const_string_empty,
+                               OF '`' IN lv_word WITH const_string_empty,
+                               OF '´' IN lv_word WITH const_string_empty,
+                               OF '!' IN lv_word WITH const_string_empty,
+                               OF '?' IN lv_word WITH const_string_empty,
+                               OF '§' IN lv_word WITH const_string_empty,
+                               OF '&' IN lv_word WITH const_string_empty,
+                               OF `'` IN lv_word WITH const_string_empty,
+                               OF '‘' IN lv_word WITH const_string_empty,
+                               OF '’' IN lv_word WITH const_string_empty,
+                               OF `©` IN lv_word WITH const_string_empty,
+                               OF '*' IN lv_word WITH const_string_empty,
+                               OF '£' IN lv_word WITH const_string_empty,
+                               OF '°' IN lv_word WITH const_string_empty,
+                               OF 'ﬁ' IN lv_word WITH 'fi',
+                               OF 'ﬂ' IN lv_word WITH 'fl',
+                               OF 'é' IN lv_word WITH 'e',
+                               OF 'è' IN lv_word WITH 'e',
+                               OF 'à' IN lv_word WITH 'a',
+                               OF 'á' IN lv_word WITH 'a',
+                               OF 'É' IN lv_word WITH 'e',
+                               OF 'È' IN lv_word WITH 'e',
+                               OF 'À' IN lv_word WITH 'a',
+                               OF 'Á' IN lv_word WITH 'a',
+                               OF '‚' IN lv_word WITH ','.
+
+      IF strlen( lv_word ) LE 1.
+        rv_word = const_string_empty.
+        RETURN. " since word is initial
+      ENDIF.
+
+      " consider some special replacement rules for German language
+      REPLACE ALL OCCURRENCES: OF 'nümmer' IN lv_word WITH 'nummer',
+                               OF 'NÜMMER' IN lv_word WITH 'NUMMER',
+                               OF 'strässe' IN lv_word WITH 'strasse',
+                               OF 'STRÄSSE' IN lv_word WITH 'STRASSE'.
+    ELSE. " consider some special characters
+      rv_word = lv_word.
+      RETURN.
+    ENDIF.
+
+    " replace first letter with 'b' if 'ß'
+    FIND REGEX '^ß.+' IN lv_word IN CHARACTER MODE.
+    IF sy-subrc EQ 0.
+      lv_word = 'b' && lv_word+1.
+    ENDIF.
+
+    IF sy-subrc NE 0.
+      " replace first letter with 'o' if '0'
+      FIND REGEX '^0[a-zA-Z]{2,}' IN lv_word IN CHARACTER MODE.
+      IF sy-subrc EQ 0.
+        lv_word = 'o' && lv_word+1.
+      ENDIF.
+    ENDIF.
+
+    " check for web address
+    REPLACE REGEX const_regex_www
+      IN lv_word WITH 'xxxxx://xxx.xxxxx.xxx'.
+
+    IF sy-subrc NE 0.
+      " check for mail address
+      REPLACE REGEX const_regex_mail
+        IN lv_word WITH 'xxx@xxxxx.xxx'.
+    ENDIF.
+
+    IF sy-subrc NE 0.
+      IF iv_letters_to_x EQ abap_true.
+        " replace all letters with x
+        REPLACE ALL OCCURRENCES OF
+          REGEX `[^0-9^/^\\^%^,^\.^:^@.]`
+          IN lv_word WITH 'x'.
+      ENDIF.
+
+      IF iv_numbers_to_0 EQ abap_true.
+        " replace all numbers with zero
+        REPLACE ALL OCCURRENCES OF
+          REGEX `\d` IN lv_word WITH '0'.
+      ENDIF.
+
+      IF sy-subrc EQ 0 AND iv_numbers_to_0 EQ abap_true.
+        try_parse_decimal(
+          EXPORTING
+            iv_number    = lv_word
+*          IMPORTING
+*            ev_dec_separ = DATA(lv_dec_separ)
+*            ev_grp_separ = DATA(lv_grp_separ)
+          RECEIVING
+            rv_success   = DATA(lv_success)
+        ).
+
+        IF lv_success EQ abap_true.
+          " make a fixed length 4 digits number with 2 decimal places
+          lv_word = '0000,00'.
+        ELSEIF lv_word CO '0123456789'.
+          " make a fixed length 10 digits number
+          lv_word = '0000000000'.
+        ENDIF.
+      ELSEIF lv_word CO '.' OR lv_word CO '@'.
+        lv_word = const_string_empty.
+      ENDIF.
+    ENDIF.
+
+    REPLACE ALL OCCURRENCES OF '@' IN lv_word WITH const_string_empty.
+    rv_word = lv_word. " returning
+  ENDMETHOD.
+
+
+  METHOD try_parse_decimal.
+
+    " assumption: max. two decimal places
+
+    DATA: index TYPE i,
+          char  TYPE char1,
+          nan   TYPE abap_bool.
+
+    DATA: lt_sep TYPE TABLE OF char1,
+          lt_pos TYPE TABLE OF i.
+
+    iv_number = condense( iv_number ).
+
+    IF NOT ( iv_number CO '0123456789.,' ).
+      rv_success = abap_false.
+      RETURN.
+    ENDIF.
+
+    WHILE index < strlen( iv_number ).
+      char = iv_number+index(1).
+      IF char EQ '.' OR char EQ ','.
+        APPEND char TO lt_sep.
+        APPEND index TO lt_pos.
+      ENDIF.
+      index = index + 1.
+    ENDWHILE.
+
+    IF lt_sep IS INITIAL.
+      RETURN.
+    ELSEIF lines( lt_sep ) > 1. " at least two
+      READ TABLE lt_sep INDEX 1 INTO DATA(lv_sep1).
+      READ TABLE lt_sep INDEX lines( lt_sep ) INTO DATA(lv_sep2).
+      IF lv_sep1 NE lv_sep2.
+        READ TABLE lt_pos INDEX lines( lt_pos ) INTO DATA(lv_pos2).
+        " check for right place of decimal separator
+        IF lv_pos2 EQ ( strlen( iv_number ) - 2 - 1 ) OR
+              lv_pos2 EQ ( strlen( iv_number ) - 1 - 1 ).
+          ev_grp_separ = lv_sep1.
+          ev_dec_separ = lv_sep2.
+          rv_success = abap_true.
+        ENDIF.
+      ELSE. " only group separators
+        ev_grp_separ = lv_sep1.
+        rv_success = abap_false.
+      ENDIF.
+    ELSE. " only one separator
+      READ TABLE lt_sep INDEX 1 INTO lv_sep1.
+      READ TABLE lt_pos INDEX 1 INTO DATA(lv_pos1).
+      " check for right place of decimal separator
+      IF lv_pos1 EQ ( strlen( iv_number ) - 2 - 1 ) OR
+            lv_pos1 EQ ( strlen( iv_number ) - 1 - 1 ).
+        ev_dec_separ = lv_sep1.
+        rv_success = abap_true.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.
+ENDCLASS.

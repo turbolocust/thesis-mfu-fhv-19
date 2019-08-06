@@ -1,0 +1,745 @@
+REPORT zreswo_ngram.
+
+* constants
+CONSTANTS: const_delay     TYPE i VALUE 4000,
+           const_unk_label TYPE string VALUE `UNKNOWN`.
+
+* parameter and data declarations
+DATA: gs_po_list TYPE /pts/po_list,
+      gs_stat    TYPE zreswo_stat,
+      gs_stat2   TYPE zreswo_stat2.
+
+SELECTION-SCREEN BEGIN OF BLOCK b00 WITH FRAME.
+SELECT-OPTIONS so_docid FOR gs_po_list-docid.
+SELECTION-SCREEN SKIP 1.
+SELECT-OPTIONS so_stopw FOR gs_stat-word NO INTERVALS.
+SELECTION-SCREEN SKIP 1.
+SELECT-OPTIONS so_sklbl FOR gs_stat2-comp NO INTERVALS.
+SELECTION-SCREEN SKIP 1.
+SELECTION-SCREEN END OF BLOCK b00.
+
+* local classes
+CLASS lcl_ngram DEFINITION FINAL.
+  PUBLIC SECTION.
+    DATA: mv_docid  TYPE /pts/po_list-docid READ-ONLY,
+          mt_words  TYPE /pts/if_po_ocr_elem=>tt_children,
+          mt_labels TYPE stringtab VALUE IS INITIAL.
+
+    METHODS constructor
+      IMPORTING
+        !iv_docid TYPE /pts/po_list-docid
+        !it_words TYPE /pts/if_po_ocr_elem=>tt_children.
+
+    METHODS select_comp
+      IMPORTING
+        !iv_word_idx TYPE i
+        !iv_dist_abs TYPE i
+      EXPORTING
+        !ev_comp     TYPE zreswo_stat2-comp
+      RETURNING
+        VALUE(rv_rc) TYPE sy-subrc.
+
+    CLASS-METHODS check_accept_comp
+      IMPORTING
+        !iv_comp         TYPE zreswo_stat2-comp
+        !iv_dist         TYPE i
+      RETURNING
+        VALUE(rv_accept) TYPE abap_bool.
+
+ENDCLASS.
+
+CLASS lcl_ngram IMPLEMENTATION.
+  METHOD constructor.
+    mv_docid = iv_docid.
+    APPEND LINES OF it_words TO mt_words.
+  ENDMETHOD.
+
+  METHOD select_comp.
+    READ TABLE mt_words INDEX iv_word_idx
+        ASSIGNING FIELD-SYMBOL(<fs_word>).
+    DATA(lo_bbox) = <fs_word>->get_bbox( ).
+    " coordinates are used to identify word
+    SELECT SINGLE comp FROM zreswo_stat2 INTO @ev_comp
+      WHERE docid = @mv_docid
+       AND dist_a EQ @iv_dist_abs
+       AND x1 = @lo_bbox->x1
+       AND x2 = @lo_bbox->x2
+       AND y1 = @lo_bbox->y1
+       AND y2 = @lo_bbox->y2.
+
+    IF sy-subrc NE 0.
+      " check mapping table for SO archive
+      SELECT SINGLE comp FROM zreswo_map2 INTO @ev_comp
+        WHERE docid = @mv_docid
+         AND x1 = @lo_bbox->x1
+         AND x2 = @lo_bbox->x2
+         AND y1 = @lo_bbox->y1
+         AND y2 = @lo_bbox->y2.
+
+      rv_rc = sy-subrc. " returning
+    ELSE.
+      rv_rc = sy-subrc. " returning
+    ENDIF.
+
+    IF rv_rc NE 0.
+      CLEAR ev_comp.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD check_accept_comp.
+    rv_accept = abap_true. " default
+    READ TABLE so_sklbl
+      WITH KEY low = iv_comp
+      TRANSPORTING NO FIELDS.
+    IF sy-subrc EQ 0.
+      rv_accept = abap_false.
+    ELSE. " check distances
+      CASE iv_comp.
+        WHEN 'EBELN' OR 'XBLNR'.
+          IF iv_dist > 2.
+            rv_accept = abap_false.
+          ENDIF.
+        WHEN 'REDAT' OR 'WMWST' OR 'WRBTR'.
+          IF iv_dist > 0.
+            rv_accept = abap_false.
+          ENDIF.
+      ENDCASE.
+    ENDIF.
+  ENDMETHOD.
+ENDCLASS.
+
+* type definitions
+TYPES: ngram_t   TYPE REF TO lcl_ngram,
+       tt_ngrams TYPE TABLE OF ngram_t.
+
+TYPES: BEGIN OF doc_elem_t,
+         docid TYPE /pts/po_list-docid,
+         elem  TYPE REF TO /pts/if_po_ocr_elem,
+       END OF doc_elem_t,
+       tt_doc_elem TYPE TABLE OF doc_elem_t.
+
+PARAMETERS: p_file TYPE char256 OBLIGATORY, " output file
+            p_whit TYPE char256, " whitelist
+            p_blck TYPE char256, " blacklist
+            p_ngsz TYPE i. " n-gram size
+
+SELECTION-SCREEN SKIP 1.
+
+PARAMETERS: p_prep  AS CHECKBOX DEFAULT abap_true,
+            p_xword AS CHECKBOX DEFAULT abap_false,
+            p_lower AS CHECKBOX DEFAULT abap_false,
+            p_fill  AS CHECKBOX DEFAULT abap_false,
+            p_line  AS CHECKBOX DEFAULT abap_false.
+
+DATA: gt_buffer TYPE stringtab,
+      gv_delay  TYPE i.
+
+DATA: gt_whitelist  TYPE HASHED TABLE OF string
+                         WITH UNIQUE KEY table_line,
+      gt_blacklist  TYPE HASHED TABLE OF string
+                         WITH UNIQUE KEY table_line,
+      gt_stop_words TYPE HASHED TABLE OF string
+                         WITH UNIQUE KEY table_line.
+
+DATA: gt_elems  TYPE tt_doc_elem,
+      gt_ngrams TYPE tt_ngrams,
+      go_logger TYPE REF TO /pts/cl_po_logger.
+
+* implementation
+INITIALIZATION.
+  go_logger = NEW #( msgid = 'SY' ).
+
+START-OF-SELECTION.
+  TRY.
+      CHECK strlen( p_file ) > 0.
+      PERFORM __populate_stop_words.
+      PERFORM __populate_blacklist.
+      PERFORM __populate_whitelist.
+      PERFORM __extract_filtered USING p_prep.
+      FREE: gt_whitelist, so_docid[]. " reclaim some memory
+      IF p_line NE abap_true.
+        PERFORM __build_ngrams_word_sensitive.
+      ELSE. " line sensitive
+        PERFORM __build_ngrams_line_sensitive.
+      ENDIF.
+      FREE: gt_elems. " no longer needed
+      PERFORM __label_ngrams.
+      PERFORM __extract_csv.
+      PERFORM __flush_buffer.
+    CATCH /pts/cx_po_error_static INTO DATA(ex).
+      WRITE / ex->get_text( ).
+  ENDTRY.
+
+  IF NOT go_logger->is_empty( ).
+    go_logger->display_log( ).
+  ENDIF.
+
+FORM __build_ngrams_word_sensitive.
+  DATA lt_q TYPE /pts/if_po_ocr_elem=>tt_children.
+  DATA lv_docid TYPE /pts/po_list-docid.
+
+  DATA(lv_i) = 1. " table access is one-based
+  DATA(lv_j) = 0.
+
+  WHILE lv_i <= lines( gt_elems ).
+    WHILE lv_j < p_ngsz AND ( lv_j + lv_i ) <= lines( gt_elems ).
+      READ TABLE gt_elems
+          INDEX ( lv_j + lv_i )
+          ASSIGNING FIELD-SYMBOL(<fs_elem>).
+      lv_docid = <fs_elem>-docid. " remember most recent one
+      APPEND <fs_elem>-elem TO lt_q.
+      lv_j = lv_j + 1.
+    ENDWHILE.
+
+    lv_j = 0. " reset
+    lv_i = lv_i + 1.
+
+    DATA(lo_ngram) = NEW lcl_ngram( it_words = lt_q
+                                    iv_docid = lv_docid ).
+    APPEND lo_ngram TO gt_ngrams.
+    CLEAR lt_q.
+
+    /pts/cl_po_utils=>progress(
+      EXPORTING
+        iv_msg           = 'Building n-grams...'
+        iv_actual_record = lv_i
+        iv_total_records = lines( gt_elems )
+        iv_incr_step     = 50
+    ).
+  ENDWHILE.
+ENDFORM.
+
+
+FORM __build_ngrams_line_sensitive.
+  DATA lt_q TYPE /pts/if_po_ocr_elem=>tt_children.
+  DATA lv_docid TYPE /pts/po_list-docid.
+
+  LOOP AT gt_elems ASSIGNING FIELD-SYMBOL(<fs_line>).
+    <fs_line>-elem->get_children(
+      IMPORTING
+        et_children = DATA(lt_words)
+    ).
+
+    DATA(lv_i) = 1. " table access is one-based
+    DATA(lv_j) = 0.
+
+    WHILE lv_i <= lines( lt_words ).
+      WHILE lv_j < p_ngsz AND ( lv_j + lv_i ) <= lines( lt_words ).
+        READ TABLE lt_words
+            INDEX ( lv_j + lv_i )
+            ASSIGNING FIELD-SYMBOL(<fs_word>).
+        lv_docid = <fs_line>-docid. " remember most recent one
+        APPEND <fs_word> TO lt_q.
+        lv_j = lv_j + 1.
+      ENDWHILE.
+
+      lv_j = 0. " reset
+      lv_i = lv_i + 1.
+
+      DATA(lo_ngram) = NEW lcl_ngram( it_words = lt_q
+                                      iv_docid = lv_docid ).
+      APPEND lo_ngram TO gt_ngrams.
+      CLEAR lt_q.
+
+      /pts/cl_po_utils=>progress(
+        EXPORTING
+          iv_msg           = 'Building n-grams...'
+          iv_actual_record = lv_i
+          iv_total_records = lines( gt_elems )
+          iv_incr_step     = 50
+      ).
+    ENDWHILE.
+  ENDLOOP.
+ENDFORM.
+
+
+FORM __label_ngrams.
+
+  CONSTANTS max_dist TYPE i VALUE 1.
+
+  DATA: lv_cur_rec  TYPE i,
+        lv_word_idx TYPE i.
+
+  DATA: lt_elim_i TYPE TABLE OF i,
+        lv_comp   TYPE zreswo_stat2-comp.
+
+  LOOP AT gt_ngrams ASSIGNING FIELD-SYMBOL(<fs_ngram>).
+    lv_cur_rec = lv_cur_rec + 1.
+    lv_word_idx = 0. " reset
+
+    LOOP AT <fs_ngram>->mt_words ASSIGNING FIELD-SYMBOL(<fs_word>).
+      lv_word_idx = lv_word_idx + 1.
+      DATA(lv_dist) = 0. " starting from zero
+
+      CLEAR lv_comp.
+
+      WHILE lv_dist <= max_dist.
+        DATA(lv_rc) = <fs_ngram>->select_comp(
+          EXPORTING
+            iv_word_idx = lv_word_idx
+            iv_dist_abs = lv_dist
+          IMPORTING
+            ev_comp     = lv_comp
+        ).
+
+        lcl_ngram=>check_accept_comp(
+          EXPORTING
+            iv_comp   = lv_comp
+            iv_dist   = lv_dist
+          RECEIVING
+            rv_accept = DATA(lv_accept)
+        ).
+
+        IF lv_accept NE abap_true.
+          CLEAR lv_comp.
+        ELSEIF lv_rc EQ 0.
+          EXIT. " match found, hence leave
+        ENDIF.
+
+        lv_dist = lv_dist + 1.
+      ENDWHILE.
+
+      IF lv_comp IS NOT INITIAL.
+        APPEND lv_comp TO <fs_ngram>->mt_labels.
+      ELSEIF p_fill EQ abap_true.
+        APPEND const_unk_label TO <fs_ngram>->mt_labels.
+      ENDIF.
+    ENDLOOP.
+
+    IF lines( <fs_ngram>->mt_labels ) EQ 0.
+      APPEND const_unk_label TO <fs_ngram>->mt_labels.
+    ENDIF.
+
+    IF p_line EQ abap_true.
+      " check if words match specified NGRAM size
+      DATA(lv_count) = lines( <fs_ngram>->mt_words ).
+      DATA(lv_non_unk) = abap_false.
+      IF lv_count < p_ngsz. " NGRAM size does not match words count
+        " check if non-UNKNOWN label is present
+        LOOP AT <fs_ngram>->mt_labels
+            ASSIGNING FIELD-SYMBOL(<fs_label>).
+          IF <fs_label> NE const_unk_label.
+            lv_non_unk = abap_true.
+            EXIT. " leave early
+          ENDIF.
+        ENDLOOP.
+        " eliminate or pad NGRAM
+        IF lv_non_unk EQ abap_true.
+          IF lv_count NE p_ngsz.
+            " sizes do not match, hence pad
+            DATA(lv_diff) = abs( lv_count - p_ngsz ).
+            DO lv_diff TIMES.
+              " set BBOX coordinates to zero for padded words
+              DATA(lo_bbox) = NEW /pts/cl_po_ocr_bbox(
+                    x1 = 0 y1 = 0 x2 = 0 y2 = 0
+              ).
+              DATA(lo_word) = NEW /pts/cl_po_ocr_word(
+                  iv_value = '\\PAD' " padded words use a dummy value
+                  io_bbox  = lo_bbox
+              ).
+              APPEND lo_word TO <fs_ngram>->mt_words.
+              IF p_fill EQ abap_true.
+                APPEND const_unk_label TO <fs_ngram>->mt_labels.
+              ENDIF.
+            ENDDO.
+          ENDIF.
+        ELSE. " only UNKNOWN label(s) is/are present
+          APPEND lv_cur_rec TO lt_elim_i.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    /pts/cl_po_utils=>progress(
+      EXPORTING
+        iv_msg           = 'Labelling n-grams...'
+        iv_actual_record = lv_cur_rec
+        iv_total_records = lines( gt_ngrams )
+        iv_incr_step     = 50
+    ).
+  ENDLOOP.
+
+  " remove lines that are to be eliminated
+  DATA(lv_del_count) = 0. " to stay within bounds
+  LOOP AT lt_elim_i INTO DATA(lv_i).
+    DELETE gt_ngrams INDEX ( lv_i - lv_del_count ).
+    lv_del_count = lv_del_count + 1.
+  ENDLOOP.
+ENDFORM.
+
+
+FORM __extract_csv.
+  DATA: lv_line TYPE string.
+  DATA(lv_cur_rec) = 0.
+  " concatenate all n-grams together with labels as CSV
+  LOOP AT gt_ngrams ASSIGNING FIELD-SYMBOL(<fs_ngram>).
+    lv_cur_rec = lv_cur_rec + 1.
+    LOOP AT <fs_ngram>->mt_words ASSIGNING FIELD-SYMBOL(<fs_word>).
+      lv_line = lv_line && <fs_word>->get_value( ) && ` `.
+    ENDLOOP.
+    " separate columns by TAB and labels by SPACE
+    lv_line = lv_line && cl_abap_char_utilities=>horizontal_tab.
+    LOOP AT <fs_ngram>->mt_labels ASSIGNING FIELD-SYMBOL(<fs_label>).
+      lv_line = lv_line && <fs_label> && ` `.
+    ENDLOOP.
+
+    FIND REGEX ` $` IN lv_line MATCH OFFSET DATA(lv_offset).
+    IF sy-subrc EQ 0.
+      " remove last space
+      DATA(lv_end) = lv_offset + 1.
+      lv_line = lv_line+0(lv_offset).
+    ENDIF.
+
+    " store document ID for later reference
+    lv_line = lv_line && cl_abap_char_utilities=>horizontal_tab &&
+        <fs_ngram>->mv_docid && cl_abap_char_utilities=>horizontal_tab.
+
+    " store coordinates of each word
+    LOOP AT <fs_ngram>->mt_words ASSIGNING <fs_word>.
+      lv_line = lv_line &&
+        <fs_word>->get_bbox( )->x1 && ` ` &&
+        <fs_word>->get_bbox( )->y1 && ` ` &&
+        <fs_word>->get_bbox( )->x2 && ` ` &&
+        <fs_word>->get_bbox( )->y2 &&
+        cl_abap_char_utilities=>horizontal_tab.
+    ENDLOOP.
+
+    " store away line to local file
+    PERFORM __append_file USING lv_line abap_false.
+    CLEAR lv_line.
+    /pts/cl_po_utils=>progress(
+      EXPORTING
+        iv_msg           = 'Extracting to file...'
+        iv_actual_record = lv_cur_rec
+        iv_total_records = lines( gt_ngrams )
+        iv_incr_step     = 50
+    ).
+  ENDLOOP.
+ENDFORM.
+
+
+FORM __extract_filtered USING uv_preprocess TYPE abap_bool
+                        RAISING /pts/cx_po_error_static.
+
+  SELECT docid FROM /pts/po_list
+      INTO TABLE @DATA(lt)
+      WHERE docid IN @so_docid.
+
+  DATA(lv_cur_rec) = 0.
+  DATA(lv_sk_wl) = xsdbool( gt_whitelist IS INITIAL ).
+  DATA(lv_sk_bl) = xsdbool( gt_blacklist IS INITIAL ).
+  DATA(lv_on_whitelist) = abap_false.
+
+  LOOP AT lt ASSIGNING FIELD-SYMBOL(<fs>).
+    lv_cur_rec = lv_cur_rec + 1.
+    /pts/cl_po_utils=>read_document(
+      EXPORTING
+        iv_docid           = <fs>-docid
+      IMPORTING
+        et_pages           = DATA(lt_pages)
+    ).
+
+    IF lt_pages IS NOT INITIAL.
+      LOOP AT lt_pages ASSIGNING FIELD-SYMBOL(<fs_page>).
+
+        DATA(lo_doc_parser) = NEW /pts/cl_po_doc_parser( <fs_page> ).
+
+        lo_doc_parser->parse_lines(
+          IMPORTING
+            et_lines = DATA(lt_lines)
+        ).
+
+        LOOP AT lt_lines ASSIGNING FIELD-SYMBOL(<fs_line>).
+          <fs_line>->get_children(
+            IMPORTING
+              et_children = DATA(lt_words)
+          ).
+
+          " line words are relevant if building line-limited NGRAMS
+          DATA lt_line_words TYPE /pts/cl_po_ocr_line=>tt_words.
+
+          LOOP AT lt_words ASSIGNING FIELD-SYMBOL(<fs_word>).
+            DATA(lv_word_value) = <fs_word>->get_value( ).
+            lv_on_whitelist = abap_false. " always reset!
+
+            IF p_lower EQ abap_true.
+              lv_word_value = to_lower( lv_word_value ).
+            ENDIF.
+
+            IF lv_sk_wl NE abap_true.
+              READ TABLE gt_whitelist
+                  WITH KEY table_line = lv_word_value
+                  TRANSPORTING NO FIELDS.
+              lv_on_whitelist = xsdbool( sy-subrc EQ 0 ).
+            ENDIF.
+
+            IF lv_sk_bl NE abap_true AND lv_on_whitelist NE abap_true.
+              READ TABLE gt_blacklist
+                  WITH KEY table_line = lv_word_value
+                  TRANSPORTING NO FIELDS.
+              IF sy-subrc EQ 0.
+                CONTINUE. " skip blacklisted word
+              ENDIF.
+            ENDIF.
+
+            IF uv_preprocess EQ abap_true.
+              lv_word_value = zcl_reswo_utils=>preprocess_word(
+                  iv_word = lv_word_value iv_letters_to_x = abap_false ).
+              IF lv_word_value IS INITIAL.
+                CONTINUE. " since word is blank or empty
+              ELSEIF p_lower NE abap_true. " to respect some replacement rules
+                lv_word_value = to_upper( lv_word_value ).
+              ENDIF.
+              " check whitelist for pre-processed value
+              READ TABLE gt_whitelist
+                  WITH KEY table_line = lv_word_value
+                  TRANSPORTING NO FIELDS.
+              lv_on_whitelist = xsdbool( sy-subrc EQ 0 ).
+              " check blacklist for pre-processed value
+              IF lv_sk_bl NE abap_true AND lv_on_whitelist NE abap_true.
+                READ TABLE gt_blacklist
+                    WITH KEY table_line = lv_word_value
+                    TRANSPORTING NO FIELDS.
+                IF sy-subrc EQ 0.
+                  CONTINUE. " skip blacklisted word
+                ENDIF.
+              ENDIF.
+              " convert to X after checking lists
+              IF p_xword EQ abap_true.
+                REPLACE ALL OCCURRENCES OF
+                  REGEX `[^0-9^/^\\^%^,^\.^:^@.]`
+                  IN lv_word_value WITH 'x'.
+              ENDIF.
+            ENDIF.
+
+            " check if word is stop word
+            READ TABLE gt_stop_words
+                WITH KEY table_line = lv_word_value
+                TRANSPORTING NO FIELDS.
+
+            IF sy-subrc EQ 0.
+              CONTINUE. " is stop word, hence ignore
+            ENDIF.
+
+            " only consider if on white-list or white-list is empty;
+            " an empty white-list means ignoring it
+            IF lv_on_whitelist EQ abap_true OR lv_sk_wl EQ abap_true.
+              IF lv_word_value IS NOT INITIAL.
+                DATA(lo_word) = NEW /pts/cl_po_ocr_word(
+                    iv_value = lv_word_value
+                    io_bbox  = <fs_word>->get_bbox( )
+                ).
+                IF p_line NE abap_true.
+                  APPEND VALUE #( elem  = lo_word
+                                  docid = <fs>-docid ) TO gt_elems.
+                ELSE. " keep information about line (line-sensitive)
+                  APPEND lo_word TO lt_line_words.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+          ENDLOOP.
+
+          IF p_line EQ abap_true.
+            " append line instead of single words
+            DATA(lo_line) = NEW /pts/cl_po_ocr_line(
+                it_children = lt_line_words
+                io_bbox = <fs_line>->get_bbox( )
+            ).
+
+            APPEND VALUE #( elem  = lo_line
+                            docid = <fs>-docid ) TO gt_elems.
+          ENDIF.
+
+          CLEAR: lt_words, lt_line_words.
+        ENDLOOP.
+
+        CLEAR lt_lines.
+      ENDLOOP.
+    ELSE.
+      go_logger->insert(
+        EXPORTING
+          msgty = go_logger->const_warning
+          msgno = '499'
+          msgv1 = 'Not found:'
+          msgv2 = <fs>-docid
+      ).
+    ENDIF.
+
+    CLEAR lt_pages.
+
+    /pts/cl_po_utils=>progress(
+      EXPORTING
+        iv_msg           = 'Building words table...'
+        iv_actual_record = lv_cur_rec
+        iv_total_records = lines( lt )
+        iv_incr_step     = 50
+    ).
+  ENDLOOP.
+ENDFORM.
+
+
+FORM __populate_stop_words.
+  IF lines( so_stopw[] ) NE 0.
+    LOOP AT so_stopw[] ASSIGNING FIELD-SYMBOL(<fs_stpw>).
+      READ TABLE gt_stop_words
+        WITH KEY table_line = <fs_stpw>
+        TRANSPORTING NO FIELDS.
+      IF sy-subrc NE 0. " does not exist
+        DATA(lv_value) = CONV string( <fs_stpw> ).
+        IF p_lower EQ abap_true.
+          lv_value = to_lower( lv_value ).
+        ENDIF.
+        INSERT lv_value INTO TABLE gt_stop_words.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+ENDFORM.
+
+
+FORM __populate_blacklist.
+
+  DATA lt_string TYPE stringtab.
+
+  IF p_blck IS NOT INITIAL.
+    cl_gui_frontend_services=>gui_upload(
+      EXPORTING
+        filename                = CONV #( p_blck )
+        filetype                = 'ASC'
+        read_by_line            = abap_true
+        codepage                = '4110'
+      CHANGING
+        data_tab                = lt_string
+      EXCEPTIONS
+        file_open_error         = 1
+        file_read_error         = 2
+        no_batch                = 3
+        gui_refuse_filetransfer = 4
+        invalid_type            = 5
+        no_authority            = 6
+        unknown_error           = 7
+        bad_data_format         = 8
+        header_not_allowed      = 9
+        separator_not_allowed   = 10
+        header_too_long         = 11
+        unknown_dp_error        = 12
+        access_denied           = 13
+        dp_out_of_memory        = 14
+        disk_full               = 15
+        dp_timeout              = 16
+        not_supported_by_gui    = 17
+        error_no_gui            = 18
+        OTHERS                  = 19
+    ).
+
+    IF sy-subrc EQ 0.
+      " must not contain any duplicates
+      INSERT LINES OF lt_string INTO TABLE gt_blacklist.
+    ENDIF.
+  ENDIF.
+ENDFORM.
+
+
+
+FORM __populate_whitelist.
+
+  DATA lt_string TYPE stringtab.
+
+  IF p_whit IS NOT INITIAL.
+    cl_gui_frontend_services=>gui_upload(
+      EXPORTING
+        filename                = CONV #( p_whit )
+        filetype                = 'ASC'
+        read_by_line            = abap_true
+        codepage                = '4110'
+      CHANGING
+        data_tab                = lt_string
+      EXCEPTIONS
+        file_open_error         = 1
+        file_read_error         = 2
+        no_batch                = 3
+        gui_refuse_filetransfer = 4
+        invalid_type            = 5
+        no_authority            = 6
+        unknown_error           = 7
+        bad_data_format         = 8
+        header_not_allowed      = 9
+        separator_not_allowed   = 10
+        header_too_long         = 11
+        unknown_dp_error        = 12
+        access_denied           = 13
+        dp_out_of_memory        = 14
+        disk_full               = 15
+        dp_timeout              = 16
+        not_supported_by_gui    = 17
+        error_no_gui            = 18
+        OTHERS                  = 19
+    ).
+
+    IF sy-subrc EQ 0.
+      " must not contain any duplicates
+      INSERT LINES OF lt_string INTO TABLE gt_whitelist.
+    ENDIF.
+  ENDIF.
+ENDFORM.
+
+
+FORM __flush_buffer.
+  IF gt_buffer IS NOT INITIAL.
+    PERFORM __append_file USING '' abap_true.
+  ENDIF.
+ENDFORM.
+
+
+FORM __append_file USING uv_line  TYPE string
+                         uv_force TYPE abap_bool.
+
+  gv_delay = gv_delay + 1.
+
+  IF gv_delay EQ const_delay OR uv_force EQ abap_true.
+    cl_gui_frontend_services=>gui_download(
+        EXPORTING
+          filename                  = CONV #( p_file )
+          filetype                  = 'ASC'    " Dateityp (Ascii, Binär, ...)
+          codepage                  = '4110'   " Zeichenrepräsentation für Ausgabe
+          append                    = abap_true
+          show_transfer_status      = abap_false
+        CHANGING
+          data_tab                  = gt_buffer
+        EXCEPTIONS
+          file_write_error          = 1
+          no_batch                  = 2
+          gui_refuse_filetransfer   = 3
+          invalid_type              = 4
+          no_authority              = 5
+          unknown_error             = 6
+          header_not_allowed        = 7
+          separator_not_allowed     = 8
+          filesize_not_allowed      = 9
+          header_too_long           = 10
+          dp_error_create           = 11
+          dp_error_send             = 12
+          dp_error_write            = 13
+          unknown_dp_error          = 14
+          access_denied             = 15
+          dp_out_of_memory          = 16
+          disk_full                 = 17
+          dp_timeout                = 18
+          file_not_found            = 19
+          dataprovider_exception    = 20
+          control_flush_error       = 21
+          not_supported_by_gui      = 22
+          error_no_gui              = 23
+          OTHERS                    = 24
+     ).
+
+    gv_delay = 0. " reset
+    CLEAR gt_buffer.
+
+    IF sy-subrc NE 0.
+      WRITE: / `Writing to file failed with code: `
+          && condense( CONV char10( sy-subrc ) ).
+      LEAVE LIST-PROCESSING.
+    ENDIF.
+  ELSE.
+    APPEND uv_line TO gt_buffer.
+  ENDIF.
+ENDFORM.

@@ -1,0 +1,2 @@
+python .\gensim_runner.py "C:\Users\Admin\PycharmProjects\pyml\word2vec\train.py" "C:\temp\ng3_src.txt" "C:\temp\Embeddings\NG3"
+python .\gensim_runner.py "C:\Users\Admin\PycharmProjects\pyml\word2vec\train.py" "C:\temp\ng4_src.txt" "C:\temp\Embeddings\NG4"
