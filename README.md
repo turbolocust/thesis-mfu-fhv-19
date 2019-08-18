@@ -6,7 +6,8 @@ Paths in scripts and batch files may need to be adjusted.
 The structure of this repository is as follows:
 
  - **code**
-	 - Contains Python scripts and batch files.
+	 - **pyml**
+		 - Contains Python scripts and batch files.
 	 - **abap**
 		 - Contains ABAP reports and classes.
  - **nmt**
