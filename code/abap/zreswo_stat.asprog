@@ -1,0 +1,243 @@
+REPORT zreswo_stat.
+
+DATA: gs_reswo_stat TYPE zreswo_stat.
+SELECT-OPTIONS: so_docid FOR gs_reswo_stat-docid NO INTERVALS.
+
+START-OF-SELECTION.
+  PERFORM execute_main.
+
+
+FORM execute_main.
+
+  DATA: lo_filereader   TYPE REF TO /pts/cl_po_filereader_serv,
+        lo_ocr_parser   TYPE REF TO /pts/cl_po_ocr_parser,
+        lo_doc_parser   TYPE REF TO /pts/cl_po_doc_parser,
+        lt_data         TYPE /pts/tt_po_text_tab,
+        lt_stat         TYPE TABLE OF zreswo_stat,
+        ls_stat         LIKE LINE OF lt_stat,
+        lo_type_descr   TYPE REF TO cl_abap_typedescr,
+        lo_struct_descr TYPE REF TO cl_abap_structdescr,
+        lt_ddic_list    TYPE ddfields,
+        lv_reswo_comp   TYPE string,
+        lv_word_temp    TYPE string,
+        lv_xnumber      TYPE abap_bool,
+        lv_xword        TYPE abap_bool.
+
+  DATA(lv_enc) = /pts/cl_po_filereader_serv=>enc_utf8.
+  lo_filereader = NEW #( iv_encoding = lv_enc ).
+
+  SELECT docid, ocr FROM /pts/po_list
+      INTO TABLE @DATA(lt_list)
+      WHERE docid IN @so_docid.
+
+  cl_abap_structdescr=>describe_by_name(
+    EXPORTING
+      p_name         = 'ZRESWO'
+    RECEIVING
+      p_descr_ref    = lo_type_descr
+    EXCEPTIONS
+      type_not_found = 1
+      OTHERS         = 2
+  ).
+
+  lo_struct_descr ?= lo_type_descr.
+
+  lo_struct_descr->get_ddic_field_list(
+    EXPORTING
+      p_langu                  = sy-langu
+      p_including_substructres = abap_false
+    RECEIVING
+      p_field_list             = lt_ddic_list
+    EXCEPTIONS
+      not_found                = 1
+      no_ddic_type             = 2
+      OTHERS                   = 3
+  ).
+
+  LOOP AT lt_list ASSIGNING FIELD-SYMBOL(<fs_list>).
+    TRY.
+        SELECT SINGLE belnr FROM zreswo_map
+            INTO @DATA(lv_belnr)
+            WHERE file_id = @<fs_list>-docid.
+        SELECT SINGLE * FROM zreswo
+            INTO @DATA(ls_reswo)
+            WHERE belnr = @lv_belnr.
+
+        ASSERT sy-subrc EQ 0.
+
+        lo_filereader->read(
+          EXPORTING
+            iv_filename              = <fs_list>-ocr
+            iv_file_type             = lo_filereader->txt
+          IMPORTING
+            et_data                  = lt_data
+        ).
+
+        DATA(lv_xml) = REDUCE string( INIT s = `` FOR row
+                                      IN lt_data NEXT s = |{ s }{ row }|
+                                    ).
+
+        lo_ocr_parser = NEW #( lv_xml ).
+        lo_ocr_parser->parse(
+          IMPORTING
+            eo_root   = DATA(lo_root)
+            et_errors = DATA(lt_errors)
+        ).
+
+        ASSERT lines( lt_errors ) EQ 0.
+
+        lo_doc_parser = NEW #( lo_root ).
+        lo_doc_parser->get_all_children(
+          EXPORTING
+            iv_class    = lo_ocr_parser->const_ocr_word
+          IMPORTING
+            et_children = DATA(lt_children)
+        ).
+
+        LOOP AT lt_children ASSIGNING FIELD-SYMBOL(<fs_word>).
+          CLEAR ls_stat. " just to be sure...
+          " do some replacements of whitespace and special characters
+          DATA(lv_word) = replace( val = <fs_word>->get_value( )
+                                   regex = '\s' with = '' occ = 0 ).
+          lv_word = condense( val = lv_word del = '.,‚\_“:}]){[(»/' ).
+
+          IF strlen( lv_word ) < 2.
+            CONTINUE. " ignore empty words and single characters
+          ENDIF.
+
+          REPLACE ALL OCCURRENCES OF '|' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF '>' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF '<' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF '(' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF ')' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF '"' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF '„' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF '`' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF '´' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF ';' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF '!' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF '?' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF '§' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF '&' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF `'` IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF '‘' IN lv_word WITH ''.
+          REPLACE ALL OCCURRENCES OF '‚' IN lv_word WITH ','.
+
+          CLEAR: lv_word_temp, lv_xnumber, lv_xword.
+
+          LOOP AT lt_ddic_list REFERENCE INTO DATA(lr_ddic).
+            IF lr_ddic->fieldname EQ 'MANDT' OR
+                lr_ddic->fieldname EQ 'CLIENT' OR
+                lr_ddic->fieldname EQ 'BUKRS' OR
+                lr_ddic->fieldname EQ 'BLART'.
+              CONTINUE. " skip internal fields
+            ENDIF.
+
+            ASSIGN COMPONENT lr_ddic->fieldname
+                OF STRUCTURE ls_reswo
+                TO FIELD-SYMBOL(<fs_reswo_comp>).
+
+            CASE lr_ddic->fieldname.
+              WHEN 'BLDAT' OR 'BUDAT'. " convert to internal date
+                CALL FUNCTION 'CONVERT_DATE_TO_EXTERNAL'
+                  EXPORTING
+                    date_internal            = <fs_reswo_comp>
+                  IMPORTING
+                    date_external            = lv_reswo_comp
+                  EXCEPTIONS
+                    date_internal_is_invalid = 1
+                    OTHERS                   = 2.
+                IF sy-subrc NE 0.
+                  lv_reswo_comp = CONV string( <fs_reswo_comp> ).
+                ENDIF.
+              WHEN 'DMBTR' OR 'WRBTR' OR 'MWSTS' OR 'WMWST'.
+                " correctly set decimal separator
+                lv_reswo_comp = replace( val = <fs_reswo_comp>
+                    sub = '.' with = ',' ).
+                IF lv_xword NE abap_true AND lv_xnumber NE abap_true.
+                  zcl_reswo_utils=>try_parse_decimal(
+                    EXPORTING
+                      iv_number      = lv_word
+                    IMPORTING
+                      ev_dec_separ   = DATA(lv_dec)
+                      ev_grp_separ   = DATA(lv_grp)
+                    RECEIVING
+                      rv_success     = DATA(lv_success)
+                  ).
+                  IF lv_success EQ abap_true.
+                    lv_word_temp = replace( val = lv_word sub = lv_dec with = ',' ).
+                    IF lv_grp IS NOT INITIAL.
+                      REPLACE ALL OCCURRENCES OF lv_grp IN lv_word_temp WITH ''.
+                    ENDIF.
+                    lv_xnumber = abap_true. " word is likely a number
+                  ELSE.
+                    lv_xword = abap_true. " is not a number
+                  ENDIF.
+                ENDIF.
+              WHEN OTHERS. " simply convert to string
+                lv_reswo_comp = CONV string( <fs_reswo_comp> ).
+            ENDCASE.
+
+            IF lv_xnumber NE abap_true.
+              /protask/cl_mdm_utils=>distance_percentage(
+                EXPORTING
+                  iv_value1   = lv_word
+                  iv_value2   = lv_reswo_comp
+                IMPORTING
+                  ev_abs_dist = DATA(lv_abs)
+                RECEIVING
+                  rv_rel_dist = DATA(lv_rel)
+              ).
+            ELSE. " is likely a number
+              /protask/cl_mdm_utils=>distance_percentage(
+                EXPORTING
+                  iv_value1   = lv_word_temp " use converted word
+                  iv_value2   = lv_reswo_comp
+                IMPORTING
+                  ev_abs_dist = lv_abs
+                RECEIVING
+                  rv_rel_dist = lv_rel
+              ).
+            ENDIF.
+
+            DATA(lv_name0) = lr_ddic->fieldname && '_A'.
+            DATA(lv_name1) = lr_ddic->fieldname && '_R'.
+
+            ASSIGN COMPONENT lv_name0
+                OF STRUCTURE ls_stat-stat
+                TO FIELD-SYMBOL(<fs_comp0>).
+
+            ASSERT sy-subrc EQ 0.
+
+            ASSIGN COMPONENT lv_name1
+                OF STRUCTURE ls_stat-stat
+                TO FIELD-SYMBOL(<fs_comp1>).
+
+            ASSERT sy-subrc EQ 0.
+
+            <fs_comp0> = lv_abs.
+            <fs_comp1> = lv_rel.
+          ENDLOOP.
+
+          DATA(lo_bbox) = <fs_word>->get_bbox( ).
+          ls_stat-docid = <fs_list>-docid.
+          ls_stat-word = CONV #( lv_word ).
+          ls_stat-word_conv = CONV #( lv_word_temp ).
+          ls_stat-belnr = lv_belnr.
+          ls_stat-x1 = lo_bbox->x1.
+          ls_stat-y1 = lo_bbox->y1.
+          ls_stat-x2 = lo_bbox->x2.
+          ls_stat-y2 = lo_bbox->y2.
+
+          APPEND ls_stat TO lt_stat.
+        ENDLOOP.
+      CATCH cx_root INTO DATA(ex).
+        MESSAGE ex->get_text( ) TYPE 'E'.
+    ENDTRY.
+
+    CLEAR: lt_data, lt_children, ls_reswo.
+  ENDLOOP.
+
+  MODIFY zreswo_stat FROM TABLE lt_stat.
+  COMMIT WORK AND WAIT.
+ENDFORM.

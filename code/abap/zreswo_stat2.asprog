@@ -1,0 +1,447 @@
+REPORT zreswo_stat2.
+
+TYPES: BEGIN OF stat_t,
+         docid        TYPE /pts/po_list-docid,
+         name         TYPE string,
+         value_s      TYPE string,
+         value_s_conv TYPE string,
+         value_t      TYPE string,
+         dist_a       TYPE i,
+         dist_r       TYPE f,
+         x1           TYPE /pts/t_po_coord,
+         y1           TYPE /pts/t_po_coord,
+         x2           TYPE /pts/t_po_coord,
+         y2           TYPE /pts/t_po_coord,
+       END OF stat_t,
+       tt_stat TYPE TABLE OF stat_t.
+
+CONSTANTS: const_vat_regex    TYPE string VALUE '((ATU)|(atu))(\d)+',
+           const_delay        TYPE i VALUE 5000,
+           const_string_empty TYPE string VALUE ''.
+
+DATA: gt_stat2 TYPE TABLE OF zreswo_stat2,
+      gs_stat2 TYPE zreswo_stat2.
+
+SELECT-OPTIONS: so_docid FOR gs_stat2-docid NO INTERVALS.
+PARAMETERS: p_file TYPE char256 OBLIGATORY,
+            p_db   AS CHECKBOX DEFAULT abap_false,
+            p_drop AS CHECKBOX DEFAULT abap_false.
+
+DATA: gt_buffer TYPE tt_stat,
+      gv_delay  TYPE i.
+
+DATA go_logger TYPE REF TO /pts/cl_po_logger.
+
+INITIALIZATION.
+  go_logger = NEW #( msgid = 'SY' ).
+
+START-OF-SELECTION.
+  TRY.
+      IF p_drop EQ abap_true AND p_db EQ abap_true.
+        PERFORM __purge_table.
+      ENDIF.
+      PERFORM build_stat_tab.
+      PERFORM __flush_buffer.
+    CATCH /pts/cx_po_error_static INTO DATA(ex).
+      WRITE: / ex->get_text( ).
+  ENDTRY.
+
+  IF NOT go_logger->is_empty( ).
+    go_logger->display_log( ).
+  ENDIF.
+
+
+FORM process_word USING uv_word TYPE string.
+  uv_word = replace( val = uv_word regex = '\s'
+                     with = '' occ = 0 ).
+  uv_word = condense( val = uv_word del = `.,‚\_“;:}]){[(»%/<>'‘` ).
+  " do some replacements
+  REPLACE ALL OCCURRENCES: OF '|' IN uv_word WITH const_string_empty,
+                           OF '>' IN uv_word WITH const_string_empty,
+                           OF '<' IN uv_word WITH const_string_empty,
+                           OF '(' IN uv_word WITH const_string_empty,
+                           OF ')' IN uv_word WITH const_string_empty,
+                           OF '"' IN uv_word WITH const_string_empty,
+                           OF '“' IN uv_word WITH const_string_empty,
+                           OF '„' IN uv_word WITH const_string_empty,
+                           OF '_' IN uv_word WITH const_string_empty,
+                           OF '`' IN uv_word WITH const_string_empty,
+                           OF '´' IN uv_word WITH const_string_empty,
+                           OF ';' IN uv_word WITH const_string_empty,
+                           OF '!' IN uv_word WITH const_string_empty,
+                           OF '?' IN uv_word WITH const_string_empty,
+                           OF '§' IN uv_word WITH const_string_empty,
+                           OF '&' IN uv_word WITH const_string_empty,
+                           OF `'` IN uv_word WITH const_string_empty,
+                           OF '‘' IN uv_word WITH const_string_empty,
+                           OF '‚' IN uv_word WITH ','.
+ENDFORM.
+
+
+FORM build_stat_tab RAISING /pts/cx_po_error_static.
+  SELECT docid, name1, xblnr,
+         ebeln, redat, wrbtr, wmwst
+      FROM /pts/po_list
+      INTO TABLE @DATA(lt)
+      WHERE docid IN @so_docid.
+
+  DATA(lv_cur_rec) = 0.
+  DATA: lv_date   TYPE string,
+        lv_amount TYPE string,
+        lv_alpha  TYPE string,
+        lt_stat   TYPE tt_stat,
+        ls_stat   TYPE stat_t.
+
+  LOOP AT lt ASSIGNING FIELD-SYMBOL(<fs>).
+    lv_cur_rec = lv_cur_rec + 1.
+    /pts/cl_po_utils=>read_document(
+      EXPORTING
+        iv_docid           = <fs>-docid
+      IMPORTING
+        et_pages           = DATA(lt_pages)
+    ).
+
+    LOOP AT lt_pages ASSIGNING FIELD-SYMBOL(<fs_page>).
+
+      DATA(lo_doc_parser) = NEW /pts/cl_po_doc_parser( <fs_page> ).
+
+      lo_doc_parser->get_all_children(
+        EXPORTING
+          iv_class    = /pts/cl_po_ocr_parser=>const_ocr_word
+        IMPORTING
+          et_children = DATA(lt_words)
+      ).
+
+      LOOP AT lt_words ASSIGNING FIELD-SYMBOL(<fs_word>).
+
+        DATA(lv_value) = <fs_word>->get_value( ).
+        PERFORM process_word USING lv_value.
+
+        IF strlen( lv_value ) < 2.
+          CONTINUE. " ignore empty words and single characters
+        ENDIF.
+
+        CLEAR ls_stat.
+
+        ls_stat-docid = <fs>-docid.
+        ls_stat-value_s = <fs_word>->get_value( ).
+        ls_stat-x1 = <fs_word>->get_bbox( )->x1.
+        ls_stat-y1 = <fs_word>->get_bbox( )->y1.
+        ls_stat-x2 = <fs_word>->get_bbox( )->x2.
+        ls_stat-y2 = <fs_word>->get_bbox( )->y2.
+
+        " check if VAT number
+        FIND REGEX const_vat_regex IN lv_value IN CHARACTER MODE.
+        IF sy-subrc EQ 0. " found VAT number
+          ls_stat-name = 'VAT_NUMBER'.
+          ls_stat-value_s_conv = lv_value.
+          APPEND ls_stat TO lt_stat.
+        ENDIF.
+
+* NAME1
+        /protask/cl_mdm_utils=>distance_percentage(
+          EXPORTING
+            iv_value1   = lv_value
+            iv_value2   = CONV #( <fs>-name1 )
+          IMPORTING
+            ev_abs_dist = DATA(lv_abs)
+          RECEIVING
+            rv_rel_dist = DATA(lv_rel)
+        ).
+
+        ls_stat-name = 'NAME1'.
+        ls_stat-value_s_conv = lv_value.
+        ls_stat-value_t = CONV #( <fs>-name1 ).
+        ls_stat-dist_a = lv_abs.
+        ls_stat-dist_r = lv_rel.
+        APPEND ls_stat TO lt_stat.
+
+* XBLNR
+        /protask/cl_mdm_utils=>distance_percentage(
+          EXPORTING
+            iv_value1   = lv_value
+            iv_value2   = CONV #( <fs>-xblnr )
+          IMPORTING
+            ev_abs_dist = lv_abs
+          RECEIVING
+            rv_rel_dist = lv_rel
+        ).
+
+        ls_stat-name = 'XBLNR'.
+        ls_stat-value_s_conv = lv_value.
+        ls_stat-value_t = CONV #( <fs>-xblnr ).
+        ls_stat-dist_a = lv_abs.
+        ls_stat-dist_r = lv_rel.
+
+        " double check against alpha converted value
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+          EXPORTING
+            input  = <fs>-xblnr
+          IMPORTING
+            output = lv_alpha.
+
+        /protask/cl_mdm_utils=>distance_percentage(
+          EXPORTING
+            iv_value1   = lv_value
+            iv_value2   = lv_alpha
+          IMPORTING
+            ev_abs_dist = lv_abs
+          RECEIVING
+            rv_rel_dist = lv_rel
+        ).
+
+        IF lv_abs < ls_stat-dist_a.
+          ls_stat-dist_a = lv_abs.
+        ENDIF.
+
+        IF lv_rel < ls_stat-dist_r.
+          ls_stat-dist_r = lv_rel.
+        ENDIF.
+
+        APPEND ls_stat TO lt_stat.
+
+* EBELN
+        /protask/cl_mdm_utils=>distance_percentage(
+          EXPORTING
+            iv_value1   = lv_value
+            iv_value2   = CONV #( <fs>-ebeln )
+          IMPORTING
+            ev_abs_dist = lv_abs
+          RECEIVING
+            rv_rel_dist = lv_rel
+        ).
+
+        ls_stat-name = 'EBELN'.
+        ls_stat-value_s_conv = lv_value.
+        ls_stat-value_t = CONV #( <fs>-ebeln ).
+        ls_stat-dist_a = lv_abs.
+        ls_stat-dist_r = lv_rel.
+
+        " double check against alpha converted value
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+          EXPORTING
+            input  = <fs>-ebeln
+          IMPORTING
+            output = lv_alpha.
+
+        /protask/cl_mdm_utils=>distance_percentage(
+          EXPORTING
+            iv_value1   = lv_value
+            iv_value2   = lv_alpha
+          IMPORTING
+            ev_abs_dist = lv_abs
+          RECEIVING
+            rv_rel_dist = lv_rel
+        ).
+
+        IF lv_abs < ls_stat-dist_a.
+          ls_stat-dist_a = lv_abs.
+        ENDIF.
+
+        IF lv_rel < ls_stat-dist_r.
+          ls_stat-dist_r = lv_rel.
+        ENDIF.
+
+        APPEND ls_stat TO lt_stat.
+
+* REDAT
+        CALL FUNCTION 'CONVERT_DATE_TO_EXTERNAL'
+          EXPORTING
+            date_internal            = <fs>-redat
+          IMPORTING
+            date_external            = lv_date
+          EXCEPTIONS
+            date_internal_is_invalid = 1
+            OTHERS                   = 2.
+
+        /protask/cl_mdm_utils=>distance_percentage(
+          EXPORTING
+            iv_value1   = lv_value
+            iv_value2   = lv_date
+          IMPORTING
+            ev_abs_dist = lv_abs
+          RECEIVING
+            rv_rel_dist = lv_rel
+        ).
+
+        ls_stat-name = 'REDAT'.
+        ls_stat-value_s_conv = lv_value.
+        ls_stat-value_t = lv_date.
+        ls_stat-dist_a = lv_abs.
+        ls_stat-dist_r = lv_rel.
+        APPEND ls_stat TO lt_stat.
+
+**********************************************************************
+*& processing of amount fields
+**********************************************************************
+        lv_value = replace( val = lv_value sub = '.' with = '' occ = 0 ).
+
+* WRBTR
+        lv_amount = condense( replace( val = CONV string( <fs>-wrbtr )
+                             sub = '.' with = ',' ) ).
+
+        IF lv_amount EQ '0'.
+          lv_amount = '0,00'.
+        ENDIF.
+
+        /protask/cl_mdm_utils=>distance_percentage(
+          EXPORTING
+            iv_value1   = lv_value
+            iv_value2   = lv_amount
+          IMPORTING
+            ev_abs_dist = lv_abs
+          RECEIVING
+            rv_rel_dist = lv_rel
+        ).
+
+        ls_stat-name = 'WRBTR'.
+        ls_stat-value_s_conv = lv_value.
+        ls_stat-value_t = lv_amount.
+        ls_stat-dist_a = lv_abs.
+        ls_stat-dist_r = lv_rel.
+        APPEND ls_stat TO lt_stat.
+
+* WMWST
+        lv_amount = condense( replace( val = CONV string( <fs>-wmwst )
+                             sub = '.' with = ',' ) ).
+
+        IF lv_amount EQ '0'.
+          lv_amount = '0,00'.
+        ENDIF.
+
+        /protask/cl_mdm_utils=>distance_percentage(
+          EXPORTING
+            iv_value1   = lv_value
+            iv_value2   = lv_amount
+          IMPORTING
+            ev_abs_dist = lv_abs
+          RECEIVING
+            rv_rel_dist = lv_rel
+        ).
+
+        ls_stat-name = 'WMWST'.
+        ls_stat-value_s_conv = lv_value.
+        ls_stat-value_t = lv_amount.
+        ls_stat-dist_a = lv_abs.
+        ls_stat-dist_r = lv_rel.
+        APPEND ls_stat TO lt_stat.
+
+        PERFORM __append_file USING lt_stat abap_false.
+        CLEAR: lv_date, lv_amount, lv_value, lt_stat.
+      ENDLOOP.
+
+      CLEAR lt_words.
+
+    ENDLOOP.
+
+    CLEAR lt_pages.
+
+    /pts/cl_po_utils=>progress(
+      EXPORTING
+        iv_msg           = 'Lots of work in progress...'
+        iv_actual_record = lv_cur_rec
+        iv_total_records = lines( lt )
+        iv_incr_step     = 20
+    ).
+  ENDLOOP.
+ENDFORM.
+
+
+FORM __purge_table.
+  SELECT mandt, docid, word, word_comp
+    FROM zreswo_stat2 INTO TABLE @DATA(lt)
+    WHERE docid IN @so_docid.
+  DELETE zreswo_stat2 FROM TABLE lt.
+  IF sy-subrc EQ 0.
+    COMMIT WORK AND WAIT.
+  ELSE.
+    ROLLBACK WORK.
+  ENDIF.
+ENDFORM.
+
+
+FORM __flush_buffer.
+  IF gt_buffer IS NOT INITIAL.
+    PERFORM __append_file USING gt_buffer abap_true.
+  ENDIF.
+ENDFORM.
+
+
+FORM __append_file USING ut_tab   TYPE tt_stat
+                         uv_force TYPE abap_bool.
+
+  gv_delay = gv_delay + 1.
+
+  IF gv_delay EQ const_delay OR uv_force EQ abap_true.
+    IF p_db EQ abap_true.
+      LOOP AT gt_buffer ASSIGNING FIELD-SYMBOL(<fs_tab>).
+        CLEAR gs_stat2.
+        gs_stat2-docid = <fs_tab>-docid.
+        gs_stat2-x1 = <fs_tab>-x1.
+        gs_stat2-x2 = <fs_tab>-x2.
+        gs_stat2-y1 = <fs_tab>-y1.
+        gs_stat2-y2 = <fs_tab>-y2.
+        gs_stat2-word = <fs_tab>-value_s.
+        gs_stat2-word_conv = <fs_tab>-value_s_conv.
+        gs_stat2-word_comp = <fs_tab>-value_t.
+        gs_stat2-comp = <fs_tab>-name.
+        gs_stat2-dist_a = <fs_tab>-dist_a.
+        gs_stat2-dist_r = <fs_tab>-dist_r.
+        APPEND gs_stat2 TO gt_stat2.
+      ENDLOOP.
+
+      MODIFY zreswo_stat2 FROM TABLE gt_stat2.
+      COMMIT WORK AND WAIT.
+      CLEAR gt_stat2.
+    ENDIF.
+
+    cl_gui_frontend_services=>gui_download(
+        EXPORTING
+          filename                  = CONV #( p_file )
+          filetype                  = 'ASC'    " Dateityp (Ascii, Binär, ...)
+          codepage                  = '4110'   " Zeichenrepräsentation für Ausgabe
+          append                    = abap_true
+          trunc_trailing_blanks     = abap_true
+          write_field_separator     = abap_true
+          show_transfer_status      = abap_false
+        CHANGING
+          data_tab                  = gt_buffer
+        EXCEPTIONS
+          file_write_error          = 1
+          no_batch                  = 2
+          gui_refuse_filetransfer   = 3
+          invalid_type              = 4
+          no_authority              = 5
+          unknown_error             = 6
+          header_not_allowed        = 7
+          separator_not_allowed     = 8
+          filesize_not_allowed      = 9
+          header_too_long           = 10
+          dp_error_create           = 11
+          dp_error_send             = 12
+          dp_error_write            = 13
+          unknown_dp_error          = 14
+          access_denied             = 15
+          dp_out_of_memory          = 16
+          disk_full                 = 17
+          dp_timeout                = 18
+          file_not_found            = 19
+          dataprovider_exception    = 20
+          control_flush_error       = 21
+          not_supported_by_gui      = 22
+          error_no_gui              = 23
+          OTHERS                    = 24
+     ).
+
+    gv_delay = 0. " reset
+    CLEAR gt_buffer.
+
+    IF sy-subrc NE 0.
+      WRITE: / `Writing to file failed with code: `
+          && condense( CONV char10( sy-subrc ) ).
+      LEAVE LIST-PROCESSING.
+    ENDIF.
+  ELSE.
+    APPEND LINES OF ut_tab TO gt_buffer.
+  ENDIF.
+ENDFORM.
